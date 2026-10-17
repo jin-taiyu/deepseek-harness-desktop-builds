@@ -24,8 +24,9 @@ trap 'rm -f "$notes"' EXIT
   printf 'Source commit: %s\n' "$BUILD_SOURCE_SHA"
   printf 'Build: https://github.com/%s/actions/runs/%s\n\n' "$DSH_DESKTOP_REPO" "$GITHUB_RUN_ID"
   printf 'The application uses local ad-hoc signing. The DMG is not Developer ID signed or notarized.\n'
-  printf 'This upstream packaging mode omits in-app automatic updates and mandatory-update policy. Install future builds with the CLI.\n'
-  printf 'Verify SHA256SUMS before installation. macOS may require first-launch approval in Privacy & Security.\n'
+  printf 'This upstream packaging mode omits in-app automatic updates and mandatory-update policy. Download future DMGs from this repository\x27s Releases.\n'
+  printf 'Fully quit DeepSeek Harness, open the DMG, drag DeepSeek Harness.app into Applications, and choose Replace. Eject the disk image after copying.\n'
+  printf 'SHA256SUMS and build-info.json are available alongside the DMG. macOS may require first-launch approval in Privacy & Security.\n'
   printf 'This is a personal build, not an official DeepSeek binary distribution. Source archives attached by GitHub contain the build automation; the application source is at the upstream link above.\n'
 } > "$notes"
 if [ "$existing" = null ]; then
