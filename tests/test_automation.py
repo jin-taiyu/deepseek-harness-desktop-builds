@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import plistlib
 import shutil
+import signal
 import sys
 
 command = Path(sys.argv[0]).name
@@ -84,6 +85,8 @@ elif command == "mv":
     if os.environ.get("DSH_TEST_FAIL_RENAME") and "/.dsh-desktop-install." in args[0] and args[0].endswith("/DeepSeek Harness.app"):
         sys.exit(9)
     os.rename(args[0], args[1])
+    if os.environ.get("DSH_TEST_INTERRUPT_RENAME") and args[0].endswith("/DeepSeek Harness.app") and "/.dsh-desktop-install." in args[0]:
+        os.kill(os.getppid(), signal.SIGTERM)
 else:
     raise RuntimeError(command)
 '''
@@ -225,6 +228,15 @@ class AutomationTests(unittest.TestCase):
         self.assertTrue((self.target / "old-application").exists())
         self.assert_clean_installation()
 
+    def test_duplicate_checksums_are_rejected(self):
+        sums = self.assets / "SHA256SUMS"
+        first_line = sums.read_text().splitlines()[0]
+        sums.write_text(first_line + "\n" + first_line + "\n")
+        result = self.run_cli("install")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.target / "old-application").exists())
+        self.assert_clean_installation()
+
     def test_successful_install_replaces_only_the_application(self):
         result = self.run_cli("install")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -240,6 +252,12 @@ class AutomationTests(unittest.TestCase):
 
     def test_failed_final_signature_restores_previous_application(self):
         result = self.run_cli("install", env=dict(self.env, DSH_TEST_FAIL_FINAL_SIGNATURE="1"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.target / "old-application").exists())
+        self.assert_clean_installation()
+
+    def test_interrupted_rename_restores_previous_application(self):
+        result = self.run_cli("install", env=dict(self.env, DSH_TEST_INTERRUPT_RENAME="1"))
         self.assertNotEqual(result.returncode, 0)
         self.assertTrue((self.target / "old-application").exists())
         self.assert_clean_installation()

@@ -141,7 +141,7 @@ dsh_install() (
     set +e
     if [ "$committed" -eq 0 ]; then
       if [ "$new_installed" -eq 1 ]; then dsh_install_command rm -rf "$target"; fi
-      if [ "$had_old" -eq 1 ]; then
+      if [ "$had_old" -eq 1 ] && dsh_install_command test -d "$stage/previous.app"; then
         if ! dsh_install_command mv "$stage/previous.app" "$target"; then
           preserve_stage=1
           printf 'Restore failed. Previous application retained at: %s/previous.app\n' "$stage" >&2
@@ -180,11 +180,11 @@ dsh_install() (
   dsh_install_command ditto "$application" "$stage/DeepSeek Harness.app"
   dsh_install_command codesign --verify --strict "$stage/DeepSeek Harness.app"
   if [ -d "$target" ]; then
-    dsh_install_command mv "$target" "$stage/previous.app"
     had_old=1
+    dsh_install_command mv "$target" "$stage/previous.app"
   fi
-  dsh_install_command mv "$stage/DeepSeek Harness.app" "$target"
   new_installed=1
+  dsh_install_command mv "$stage/DeepSeek Harness.app" "$target"
   dsh_install_command codesign --verify --strict "$target"
   committed=1
   printf 'Installed %s at %s\n' "$version" "$target"
