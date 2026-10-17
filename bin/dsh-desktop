@@ -1,0 +1,277 @@
+#!/bin/bash
+set -euo pipefail
+
+DSH_DESKTOP_REPO="${DSH_DESKTOP_REPO:-jin-taiyu/deepseek-harness-desktop-builds}"
+DSH_UPSTREAM_REPO=deepseek-ai/deepseek-harness
+DSH_APPLICATIONS_DIR="${DSH_APPLICATIONS_DIR:-/Applications}"
+DSH_JQ='
+def version_key:
+  capture("^(?<major>0|[1-9][0-9]*)[.](?<minor>0|[1-9][0-9]*)[.](?<patch>0|[1-9][0-9]*)(-(?<pre>[0-9A-Za-z-]+([.][0-9A-Za-z-]+)*))?([+][0-9A-Za-z-]+([.][0-9A-Za-z-]+)*)?$")
+  | (.pre // "") as $pre
+  | select([$pre | split(".")[] | select(test("^[0-9]+$")) | test("^0[0-9]")] | any | not)
+  | [(.major | tonumber), (.minor | tonumber), (.patch | tonumber),
+     (if $pre == "" then 1 else 0 end),
+     ($pre | split(".") | map(if test("^[0-9]+$") then [0, tonumber] else [1, .] end))];
+def sorted_releases($prefix):
+  map(select(.draft == false and .published_at != null)
+    | . as $release
+    | (.tag_name | select(startswith($prefix)) | ltrimstr($prefix)) as $version
+    | ($version | version_key) as $key
+    | $release + {_version: $version, _version_key: $key})
+  | sort_by([._version_key, .published_at, .id]);
+def complete_build:
+  . as $release
+  | "deepseek-harness-\(._version)-mac-arm64-unsigned.dmg" as $dmg
+  | [.assets[]? | select(.state == "uploaded" and .size > 0) | .name] as $names
+  | select([$dmg, "SHA256SUMS", "build-info.json"] | all(. as $name | $names | index($name) != null));
+'
+
+dsh_fail() {
+  printf '%s\n' "$*" >&2
+  return 1
+}
+
+dsh_require() {
+  local tool
+  for tool in "$@"; do
+    command -v "$tool" >/dev/null 2>&1 || { dsh_fail "Missing command: $tool"; return 1; }
+  done
+}
+
+dsh_validate_tag() {
+  printf '%s\n' "$1" | jq -e "$DSH_JQ select(startswith(\"dsh-v\")) | ltrimstr(\"dsh-v\") | version_key" -R >/dev/null || {
+    dsh_fail 'Expected a complete upstream tag such as dsh-v0.2.1-alpha.5'
+    return 1
+  }
+}
+
+dsh_releases() {
+  gh api --paginate --slurp "repos/$1/releases?per_page=100" | jq -ce 'add // []'
+}
+
+dsh_latest_upstream() {
+  dsh_releases "$DSH_UPSTREAM_REPO" | jq -ce "$DSH_JQ sorted_releases(\"dsh-v\") | last // error(\"No upstream Release found\")"
+}
+
+dsh_built_release() {
+  local tag="${1:-}"
+  local releases
+  releases=$(dsh_releases "$DSH_DESKTOP_REPO") || return 1
+  if [ -n "$tag" ]; then
+    dsh_validate_tag "$tag" || return 1
+    printf '%s\n' "$releases" | jq -ce --arg version "${tag#dsh-v}" "$DSH_JQ sorted_releases(\"desktop-v\") | map(select(._version == \$version) | complete_build) | last // error(\"No complete build for this tag\")"
+  else
+    printf '%s\n' "$releases" | jq -ce "$DSH_JQ sorted_releases(\"desktop-v\") | map(complete_build) | last // error(\"No complete Desktop build found\")"
+  fi
+}
+
+dsh_validate_download() {
+  local directory="$1"
+  local release="$2"
+  local version artifact digest name extra count=0 dmg_count=0 metadata_count=0
+  version=$(printf '%s\n' "$release" | jq -er '._version') || return 1
+  artifact="deepseek-harness-$version-mac-arm64-unsigned.dmg"
+  while read -r digest name extra; do
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { dsh_fail 'Invalid checksum entry'; return 1; }
+    [ -z "$extra" ] || { dsh_fail 'Unexpected checksum fields'; return 1; }
+    case "$name" in
+      "$artifact") dmg_count=$((dmg_count + 1)) ;;
+      build-info.json) metadata_count=$((metadata_count + 1)) ;;
+      *) dsh_fail "Unexpected checksum path: $name"; return 1 ;;
+    esac
+    count=$((count + 1))
+  done < "$directory/SHA256SUMS"
+  [ "$count" -eq 2 ] && [ "$dmg_count" -eq 1 ] && [ "$metadata_count" -eq 1 ] || { dsh_fail 'Expected one checksum for each downloaded file'; return 1; }
+  (cd "$directory" && shasum -a 256 -c SHA256SUMS) >&2 || return 1
+  digest=$(shasum -a 256 "$directory/$artifact") || return 1
+  digest="${digest%% *}"
+  jq -e --arg version "$version" --arg artifact "$artifact" --arg digest "$digest" --arg repo "$DSH_UPSTREAM_REPO" '
+    .schema_version == 1 and .version == $version
+    and .upstream.repository == $repo and .upstream.tag == ("dsh-v" + $version)
+    and (.upstream.commit | test("^[0-9a-f]{40}$"))
+    and .target.platform == "darwin" and .target.arch == "arm64"
+    and .application.name == "DeepSeek Harness.app"
+    and .application.bundle_id == "com.deepseek.harness"
+    and .artifact.name == $artifact and .artifact.sha256 == $digest
+    and .signing == "ad-hoc" and .automatic_updates == false
+  ' "$directory/build-info.json" >/dev/null || { dsh_fail 'Build metadata validation failed'; return 1; }
+}
+
+dsh_download_into() {
+  local release="$1"
+  local directory="$2"
+  local tag version artifact
+  tag=$(printf '%s\n' "$release" | jq -er '.tag_name') || return 1
+  version=$(printf '%s\n' "$release" | jq -er '._version') || return 1
+  artifact="deepseek-harness-$version-mac-arm64-unsigned.dmg"
+  mkdir -p "$directory" || return 1
+  gh release download "$tag" --repo "$DSH_DESKTOP_REPO" --dir "$directory" \
+    --pattern "$artifact" --pattern SHA256SUMS --pattern build-info.json || return 1
+  dsh_validate_download "$directory" "$release"
+}
+
+dsh_running() {
+  ps -axo command= | awk -v app="$1/Contents/" 'index($0, app) == 1 { found = 1 } END { exit !found }'
+}
+
+dsh_install() (
+  set -euo pipefail
+  local tag="${1:-}"
+  local release version artifact temporary mountpoint application target stage=''
+  local mounted=0 privileged=0 had_old=0 new_installed=0 committed=0 preserve_stage=0
+  dsh_require gh jq shasum hdiutil ditto plutil codesign file ps awk mktemp
+  [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] || { dsh_fail 'Installation requires an Apple Silicon Mac'; exit 1; }
+  [[ "$DSH_APPLICATIONS_DIR" = /* ]] && [ -d "$DSH_APPLICATIONS_DIR" ] && [ ! -L "$DSH_APPLICATIONS_DIR" ] || { dsh_fail 'Applications directory must be an existing absolute directory, not a symlink'; exit 1; }
+  target="$DSH_APPLICATIONS_DIR/DeepSeek Harness.app"
+  [ ! -L "$target" ] || { dsh_fail 'Refusing to replace a linked application'; exit 1; }
+  if [ -e "$target" ] && [ ! -d "$target" ]; then dsh_fail 'Application destination is not a directory'; exit 1; fi
+  if dsh_running "$target"; then dsh_fail 'Fully quit DeepSeek Harness and its dsh commands before installing'; exit 1; fi
+  if [ ! -w "$DSH_APPLICATIONS_DIR" ] || { [ -d "$target/Contents" ] && [ ! -w "$target/Contents" ]; }; then
+    privileged=1
+    sudo -v
+  fi
+  dsh_install_command() {
+    if [ "$privileged" -eq 1 ]; then sudo "$@"; else "$@"; fi
+  }
+  temporary=$(mktemp -d "${TMPDIR:-/tmp}/dsh-desktop.XXXXXX")
+  mountpoint="$temporary/mount"
+  dsh_install_cleanup() {
+    local status=$?
+    trap - EXIT INT TERM
+    set +e
+    if [ "$committed" -eq 0 ]; then
+      if [ "$new_installed" -eq 1 ]; then dsh_install_command rm -rf "$target"; fi
+      if [ "$had_old" -eq 1 ]; then
+        if ! dsh_install_command mv "$stage/previous.app" "$target"; then
+          preserve_stage=1
+          printf 'Restore failed. Previous application retained at: %s/previous.app\n' "$stage" >&2
+        fi
+      fi
+    fi
+    if [ -n "$stage" ] && [ "$preserve_stage" -eq 0 ]; then dsh_install_command rm -rf "$stage"; fi
+    if [ "$mounted" -eq 1 ]; then
+      if hdiutil detach "$mountpoint" >/dev/null || hdiutil detach -force "$mountpoint" >/dev/null; then mounted=0; fi
+    fi
+    if [ "$mounted" -eq 0 ]; then rm -rf "$temporary"; else printf 'Could not unmount: %s\n' "$mountpoint" >&2; fi
+    exit "$status"
+  }
+  trap dsh_install_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  release=$(dsh_built_release "$tag")
+  version=$(printf '%s\n' "$release" | jq -er '._version')
+  artifact="deepseek-harness-$version-mac-arm64-unsigned.dmg"
+  dsh_download_into "$release" "$temporary/download"
+  mkdir "$mountpoint"
+  hdiutil verify "$temporary/download/$artifact" >/dev/null
+  hdiutil attach "$temporary/download/$artifact" -readonly -nobrowse -mountpoint "$mountpoint" >/dev/null
+  mounted=1
+  application="$mountpoint/DeepSeek Harness.app"
+  [ -d "$application" ] && [ ! -L "$application" ]
+  [ "$(plutil -extract CFBundleShortVersionString raw -o - "$application/Contents/Info.plist")" = "$version" ]
+  [ "$(plutil -extract CFBundleIdentifier raw -o - "$application/Contents/Info.plist")" = com.deepseek.harness ]
+  local executable
+  executable=$(plutil -extract CFBundleExecutable raw -o - "$application/Contents/Info.plist")
+  case "$executable" in ''|*/*|.|..) dsh_fail 'Invalid application executable'; exit 1 ;; esac
+  file "$application/Contents/MacOS/$executable" | grep -q arm64
+  codesign --verify --strict "$application"
+  if dsh_running "$target"; then dsh_fail 'DeepSeek Harness started during download; fully quit it and retry'; exit 1; fi
+  stage=$(dsh_install_command mktemp -d "$DSH_APPLICATIONS_DIR/.dsh-desktop-install.XXXXXX")
+  dsh_install_command ditto "$application" "$stage/DeepSeek Harness.app"
+  dsh_install_command codesign --verify --strict "$stage/DeepSeek Harness.app"
+  if [ -d "$target" ]; then
+    dsh_install_command mv "$target" "$stage/previous.app"
+    had_old=1
+  fi
+  dsh_install_command mv "$stage/DeepSeek Harness.app" "$target"
+  new_installed=1
+  dsh_install_command codesign --verify --strict "$target"
+  committed=1
+  printf 'Installed %s at %s\n' "$version" "$target"
+  printf '%s\n' 'If macOS blocks the first launch, allow the application in System Settings > Privacy & Security.'
+)
+
+dsh_check() {
+  local upstream built
+  upstream=$(dsh_latest_upstream)
+  printf 'Upstream: %s\n' "$(printf '%s\n' "$upstream" | jq -er '.tag_name')"
+  built=$(dsh_built_release '') || return 1
+  printf 'Built:    %s\n' "$(printf '%s\n' "$built" | jq -er '.tag_name')"
+  if [ -f "$DSH_APPLICATIONS_DIR/DeepSeek Harness.app/Contents/Info.plist" ] && command -v plutil >/dev/null 2>&1; then
+    printf 'Installed: %s\n' "$(plutil -extract CFBundleShortVersionString raw -o - "$DSH_APPLICATIONS_DIR/DeepSeek Harness.app/Contents/Info.plist")"
+  fi
+}
+
+dsh_build() {
+  local tag='' wait_for_run=0 request_id run_id='' attempts=0 runs
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --wait) wait_for_run=1 ;;
+      --*) dsh_fail "Unknown build option: $1"; return 1 ;;
+      *) [ -z "$tag" ] || { dsh_fail 'Specify only one upstream tag'; return 1; }; tag="$1" ;;
+    esac
+    shift
+  done
+  if [ -n "$tag" ]; then dsh_validate_tag "$tag" || return 1; fi
+  request_id="$(date +%s)-$$-$RANDOM"
+  gh workflow run desktop.yml --repo "$DSH_DESKTOP_REPO" --ref main \
+    -f "upstream_tag=$tag" -f "request_id=$request_id"
+  printf 'Build requested: %s\n' "$request_id"
+  if [ "$wait_for_run" -eq 0 ]; then
+    printf 'https://github.com/%s/actions/workflows/desktop.yml\n' "$DSH_DESKTOP_REPO"
+    return 0
+  fi
+  while [ "$attempts" -lt 20 ]; do
+    runs=$(gh run list --repo "$DSH_DESKTOP_REPO" --workflow desktop.yml --event workflow_dispatch --limit 50 --json databaseId,displayTitle)
+    run_id=$(printf '%s\n' "$runs" | jq -r --arg id "$request_id" '[.[] | select(.displayTitle | endswith($id))][0].databaseId // empty')
+    [ -n "$run_id" ] && break
+    attempts=$((attempts + 1))
+    sleep 2
+  done
+  [ -n "$run_id" ] || { dsh_fail "Build dispatched, but its run is not visible yet. Request: $request_id"; return 1; }
+  gh run watch "$run_id" --repo "$DSH_DESKTOP_REPO" --interval 15 --exit-status
+}
+
+dsh_download() {
+  local tag='' directory='' release
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dest) [ "$#" -gt 1 ] || { dsh_fail '--dest requires a directory'; return 1; }; directory="$2"; shift ;;
+      --*) dsh_fail "Unknown download option: $1"; return 1 ;;
+      *) [ -z "$tag" ] || { dsh_fail 'Specify only one upstream tag'; return 1; }; tag="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$directory" ] || { dsh_fail 'Use --dest to choose a download directory'; return 1; }
+  release=$(dsh_built_release "$tag")
+  dsh_download_into "$release" "$directory"
+  printf 'Verified download: %s\n' "$directory"
+}
+
+dsh_usage() {
+  printf '%s\n' \
+    'dsh-desktop check' \
+    'dsh-desktop build [dsh-vVERSION] [--wait]' \
+    'dsh-desktop download [dsh-vVERSION] --dest DIRECTORY' \
+    'dsh-desktop install [dsh-vVERSION]'
+}
+
+dsh_main() {
+  local command="${1:-help}"
+  if [ "$#" -gt 0 ]; then shift; fi
+  case "$command" in
+    help|-h|--help) dsh_usage; return 0 ;;
+  esac
+  dsh_require gh jq shasum
+  case "$DSH_DESKTOP_REPO" in *[!A-Za-z0-9_./-]*|/*|*/|*/*/*) dsh_fail 'Invalid DSH_DESKTOP_REPO'; return 1 ;; esac
+  gh auth status >/dev/null 2>&1 || { dsh_fail 'Authenticate first with: gh auth login'; return 1; }
+  case "$command" in
+    check) [ "$#" -eq 0 ] || { dsh_fail 'check takes no arguments'; return 1; }; dsh_check ;;
+    build) dsh_build "$@" ;;
+    download) dsh_download "$@" ;;
+    install) [ "$#" -le 1 ] || { dsh_fail 'Specify at most one upstream tag'; return 1; }; dsh_install "${1:-}" ;;
+    *) dsh_fail "Unknown command: $command"; return 1 ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then dsh_main "$@"; fi
