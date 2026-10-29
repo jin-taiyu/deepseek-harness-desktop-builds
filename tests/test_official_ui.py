@@ -65,6 +65,24 @@ class OfficialUiTests(unittest.TestCase):
         self.assertEqual((self.root / TARGET).read_bytes(), original)
         self.assertEqual(self.git("diff", "--name-only").stdout, "")
 
+    def test_older_official_packaging_needs_no_source_patch(self):
+        (self.root / TARGET).write_text("await execute(['run', 'build:official'], buildEnv, REPOSITORY_ROOT)\n"
+            "await execute(['run', 'release:pack', '--family', 'dsh', '--out', buildPaths.packedDsh, ...packArguments], buildEnv, REPOSITORY_ROOT)\n")
+        self.git("rm", PACK)
+        self.git("add", ".")
+        self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "older official packaging")
+        result = self.run_patch("apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.run_patch("verify").returncode, 0)
+        self.assertEqual(self.git("diff", "--name-only").stdout, "")
+
+    def test_unknown_packaging_without_local_pack_is_rejected(self):
+        self.git("rm", PACK)
+        self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "missing stage")
+        result = self.run_patch("apply")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unsupported upstream source", result.stderr)
+
     def test_dirty_source_is_rejected_before_applying(self):
         (self.root / "untouched.ts").write_text("modified\n")
         result = self.run_patch("apply")

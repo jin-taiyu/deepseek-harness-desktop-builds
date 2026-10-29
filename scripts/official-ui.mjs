@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -29,6 +29,18 @@ function git(source, args) {
 }
 
 function expectedFiles(source) {
+  const localPack = replacements[1].path;
+  if (git(source, ['ls-tree', '--name-only', 'HEAD', '--', localPack]) === '') {
+    const target = execFileSync('git', ['show', `HEAD:${replacements[0].path}`], { cwd: source, encoding: 'utf8' });
+    const officialStages = [
+      "await execute(['run', 'build:official'], buildEnv, REPOSITORY_ROOT)",
+      "await execute(['run', 'release:pack', '--family', 'dsh', '--out', buildPaths.packedDsh, ...packArguments], buildEnv, REPOSITORY_ROOT)",
+    ];
+    if (existsSync(resolve(source, localPack)) || !officialStages.every(stage => target.split(stage).length === 2)) {
+      throw new Error('Unsupported upstream source; expected official build and package stages');
+    }
+    return [];
+  }
   return replacements.map(({ path, edits }) => {
     const original = execFileSync('git', ['show', `HEAD:${path}`], { cwd: source, encoding: 'utf8' });
     let patched = original;
