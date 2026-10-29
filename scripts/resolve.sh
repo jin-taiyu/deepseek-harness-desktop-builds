@@ -15,13 +15,14 @@ version="${tag#dsh-v}"
 source_sha=$(gh api "repos/$DSH_UPSTREAM_REPO/commits/$tag" --jq .sha)
 [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
 prerelease=$(printf '%s\n' "$release" | jq -r '.prerelease or (._version | split("+")[0] | contains("-"))')
-own_release=$(dsh_releases "$DSH_DESKTOP_REPO" | jq -c --arg tag "desktop-v$version" '[.[] | select(.tag_name == $tag)] | first // null')
+own_release=$(dsh_releases "$DSH_DESKTOP_REPO" | jq -c --arg tag "desktop-v$version$DSH_DESKTOP_RELEASE_SUFFIX" '[.[] | select(.tag_name == $tag)] | first // null')
 should_build=true
 if [ "$own_release" != null ]; then
   if printf '%s\n' "$own_release" | jq -e --arg version "$version" "$DSH_JQ . + {_version: \$version} | select(.draft == false) | complete_build" >/dev/null; then
-    manifest=$(gh release download "desktop-v$version" --repo "$DSH_DESKTOP_REPO" --pattern build-info.json --output -)
+    manifest=$(gh release download "desktop-v$version$DSH_DESKTOP_RELEASE_SUFFIX" --repo "$DSH_DESKTOP_REPO" --pattern build-info.json --output -)
     printf '%s\n' "$manifest" | jq -e --arg sha "$source_sha" --arg tag "$tag" --arg version "$version" --arg repo "$DSH_UPSTREAM_REPO" \
-      '.schema_version == 1 and .upstream.repository == $repo and .upstream.tag == $tag and .upstream.commit == $sha and .version == $version' >/dev/null || {
+      '.schema_version == 1 and .upstream.repository == $repo and .upstream.tag == $tag and .upstream.commit == $sha and .version == $version
+      and .build_recipe == "official-ui-v1" and .client.profile == "official"' >/dev/null || {
       dsh_fail 'Published build metadata differs from the current upstream tag; refusing to overwrite it'
       exit 1
     }

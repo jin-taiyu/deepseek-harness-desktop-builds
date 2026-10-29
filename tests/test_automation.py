@@ -102,6 +102,12 @@ def release(version, prefix="dsh-v", draft=False, complete=False, published="202
             "prerelease": "-" in version, "published_at": published, "assets": assets}
 
 
+def official_release(version, published="2026-10-17T12:00:00Z"):
+    result = release(version, "desktop-v", complete=True, published=published)
+    result["tag_name"] += "+official.1"
+    return result
+
+
 class AutomationTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="dsh automation ")
@@ -118,6 +124,10 @@ class AutomationTests(unittest.TestCase):
         payload = b"unit-test-dmg"
         (self.assets / filename).write_bytes(payload)
         metadata = {"schema_version": 1, "version": VERSION,
+                    "build_recipe": "official-ui-v1", "source_patch": {"recipe": "official-ui-v1"},
+                    "client": {"profile": "official", "title": "DeepSeek Harness", "environment": {
+                        "DSH_CLIENT_BUILD_PROFILE": "official", "DSH_CLIENT_TITLE": "DeepSeek Harness",
+                        "DSH_CLIENT_VERSION": VERSION, "DSH_CLIENT_COMMIT_HASH": COMMIT[:7]}},
                     "upstream": {"repository": "deepseek-ai/deepseek-harness", "tag": "dsh-v" + VERSION, "commit": COMMIT},
                     "target": {"platform": "darwin", "arch": "arm64"},
                     "application": {"name": "DeepSeek Harness.app", "bundle_id": "com.deepseek.harness"},
@@ -128,7 +138,7 @@ class AutomationTests(unittest.TestCase):
         (self.assets / "SHA256SUMS").write_text(
             f"{hashlib.sha256(payload).hexdigest()}  {filename}\n"
             f"{hashlib.sha256(metadata_bytes).hexdigest()}  build-info.json\n")
-        self.write_releases([release(VERSION)], [release(VERSION, "desktop-v", complete=True)])
+        self.write_releases([release(VERSION)], [official_release(VERSION)])
         self.applications = self.root / "Applications"
         self.applications.mkdir()
         self.target = self.applications / "DeepSeek Harness.app"
@@ -197,6 +207,34 @@ class AutomationTests(unittest.TestCase):
         result = self.resolve()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("should_build=true", (self.root / "outputs").read_text())
+
+    def test_legacy_build_requires_official_ui_revision(self):
+        self.write_releases([release(VERSION)], [release(VERSION, "desktop-v", complete=True)])
+        result = self.resolve()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("should_build=true", (self.root / "outputs").read_text())
+
+    def test_corrected_release_keeps_the_product_version(self):
+        self.write_releases([release(VERSION)], [official_release(VERSION), release(VERSION, "desktop-v", complete=True)])
+        for tag in ["", "dsh-v" + VERSION]:
+            result = self.source('dsh_built_release "' + tag + '"')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            selected = json.loads(result.stdout)
+            self.assertEqual(selected["_version"], VERSION)
+            self.assertEqual(selected["tag_name"], "desktop-v" + VERSION + "+official.1")
+
+    def test_local_profile_is_rejected_for_corrected_release(self):
+        metadata = self.assets / "build-info.json"
+        data = json.loads(metadata.read_text())
+        data["client"]["profile"] = "local"
+        metadata.write_text(json.dumps(data))
+        sums = self.assets / "SHA256SUMS"
+        sums.write_text(sums.read_text().splitlines()[0] + "\n" + hashlib.sha256(metadata.read_bytes()).hexdigest() + "  build-info.json\n")
+        result = self.run_cli("install")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Build metadata validation failed", result.stderr)
+        self.assertTrue((self.target / "old-application").exists())
+        self.assert_clean_installation()
 
     def test_retargeted_upstream_tag_is_not_overwritten(self):
         result = self.resolve(DSH_TEST_COMMIT="2" * 40)

@@ -3,6 +3,7 @@ set -euo pipefail
 
 DSH_DESKTOP_REPO="${DSH_DESKTOP_REPO:-jin-taiyu/deepseek-harness-desktop-builds}"
 DSH_UPSTREAM_REPO=deepseek-ai/deepseek-harness
+DSH_DESKTOP_RELEASE_SUFFIX=+official.1
 DSH_APPLICATIONS_DIR="${DSH_APPLICATIONS_DIR:-/Applications}"
 DSH_JQ='
 def version_key:
@@ -24,6 +25,8 @@ def complete_build:
   | "deepseek-harness-\(._version)-mac-arm64-unsigned.dmg" as $dmg
   | [.assets[]? | select(.state == "uploaded" and .size > 0) | .name] as $names
   | select([$dmg, "SHA256SUMS", "build-info.json"] | all(. as $name | $names | index($name) != null));
+def desktop_releases:
+  sorted_releases("desktop-v") | map(._version |= sub("[+]official[.]1$"; ""));
 '
 
 dsh_fail() {
@@ -59,16 +62,16 @@ dsh_built_release() {
   releases=$(dsh_releases "$DSH_DESKTOP_REPO") || return 1
   if [ -n "$tag" ]; then
     dsh_validate_tag "$tag" || return 1
-    printf '%s\n' "$releases" | jq -ce --arg version "${tag#dsh-v}" "$DSH_JQ sorted_releases(\"desktop-v\") | map(select(._version == \$version) | complete_build) | last // error(\"No complete build for this tag\")"
+    printf '%s\n' "$releases" | jq -ce --arg version "${tag#dsh-v}" "$DSH_JQ desktop_releases | map(select(._version == \$version) | complete_build) | last // error(\"No complete build for this tag\")"
   else
-    printf '%s\n' "$releases" | jq -ce "$DSH_JQ sorted_releases(\"desktop-v\") | map(complete_build) | last // error(\"No complete Desktop build found\")"
+    printf '%s\n' "$releases" | jq -ce "$DSH_JQ desktop_releases | map(complete_build) | last // error(\"No complete Desktop build found\")"
   fi
 }
 
 dsh_validate_download() {
   local directory="$1"
   local release="$2"
-  local version artifact digest name extra count=0 dmg_count=0 metadata_count=0
+  local version artifact digest name extra official=false count=0 dmg_count=0 metadata_count=0
   version=$(printf '%s\n' "$release" | jq -er '._version') || return 1
   artifact="deepseek-harness-$version-mac-arm64-unsigned.dmg"
   while read -r digest name extra; do
@@ -85,7 +88,8 @@ dsh_validate_download() {
   (cd "$directory" && shasum -a 256 -c SHA256SUMS) >&2 || return 1
   digest=$(shasum -a 256 "$directory/$artifact") || return 1
   digest="${digest%% *}"
-  jq -e --arg version "$version" --arg artifact "$artifact" --arg digest "$digest" --arg repo "$DSH_UPSTREAM_REPO" '
+  if [[ "$(printf '%s\n' "$release" | jq -r '.tag_name // ""')" = *"$DSH_DESKTOP_RELEASE_SUFFIX" ]]; then official=true; fi
+  jq -e --arg version "$version" --arg artifact "$artifact" --arg digest "$digest" --arg repo "$DSH_UPSTREAM_REPO" --argjson official "$official" '
     .schema_version == 1 and .version == $version
     and .upstream.repository == $repo and .upstream.tag == ("dsh-v" + $version)
     and (.upstream.commit | test("^[0-9a-f]{40}$"))
@@ -94,6 +98,13 @@ dsh_validate_download() {
     and .application.bundle_id == "com.deepseek.harness"
     and .artifact.name == $artifact and .artifact.sha256 == $digest
     and .signing == "ad-hoc" and .automatic_updates == false
+    and (if $official then .build_recipe == "official-ui-v1" and .source_patch.recipe == "official-ui-v1"
+      and .client.profile == "official" and .client.title == "DeepSeek Harness"
+      and .client.environment.DSH_CLIENT_BUILD_PROFILE == "official"
+      and .client.environment.DSH_CLIENT_TITLE == "DeepSeek Harness"
+      and .client.environment.DSH_CLIENT_VERSION == $version
+      and .client.environment.DSH_CLIENT_COMMIT_HASH == .upstream.commit[0:7]
+      else true end)
   ' "$directory/build-info.json" >/dev/null || { dsh_fail 'Build metadata validation failed'; return 1; }
 }
 
