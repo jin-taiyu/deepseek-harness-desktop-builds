@@ -6,9 +6,9 @@ source "$repository_root/bin/dsh-desktop"
 directory="$1"
 version="$BUILD_VERSION"
 upstream_tag="$BUILD_UPSTREAM_TAG"
-release_tag="desktop-v$version"
+release_tag="desktop-v$version$DSH_DESKTOP_RELEASE_SUFFIX"
 artifact="deepseek-harness-$version-mac-arm64-unsigned.dmg"
-release=$(jq -nc --arg version "$version" '{_version:$version}')
+release=$(jq -nc --arg version "$version" --arg tag "$release_tag" '{_version:$version,tag_name:$tag}')
 dsh_validate_download "$directory" "$release"
 jq -e --arg sha "$BUILD_SOURCE_SHA" '.upstream.commit == $sha' "$directory/build-info.json" >/dev/null
 existing=$(dsh_releases "$DSH_DESKTOP_REPO" | jq -c --arg tag "$release_tag" '[.[] | select(.tag_name == $tag)] | first // null')
@@ -19,7 +19,9 @@ fi
 notes=$(mktemp)
 trap 'rm -f "$notes"' EXIT
 {
-  printf 'Personal macOS arm64 build from unmodified official DeepSeek Harness Desktop source.\n\n'
+  printf 'Personal macOS arm64 build from official DeepSeek Harness Desktop source, with a recorded packaging patch selecting the official client UI profile.\n\n'
+  printf 'The sidebar uses the upstream DeepSeek Harness brand components, without the local-build label or commit badge. Product version: %s.\n' "$version"
+  printf 'The +official.1 Release suffix identifies this packaging revision; it does not change the application version. Earlier Releases are retained.\n\n'
   printf 'Upstream: https://github.com/%s/releases/tag/%s\n' "$DSH_UPSTREAM_REPO" "$upstream_tag"
   printf 'Source commit: %s\n' "$BUILD_SOURCE_SHA"
   printf 'Build: https://github.com/%s/actions/runs/%s\n\n' "$DSH_DESKTOP_REPO" "$GITHUB_RUN_ID"

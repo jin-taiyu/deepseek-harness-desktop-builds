@@ -103,6 +103,8 @@ jobs:
       - name: Install locked dependencies
         shell: bash
         run: pnpm --dir source install --frozen-lockfile
+      - name: Select official client branding for the personal build
+        run: node automation/scripts/official-ui.mjs apply source
       - name: Build official Desktop without Developer ID
         shell: bash
         run: |
@@ -119,6 +121,7 @@ jobs:
           mkdir package
           mv "source/apps/desktop/.desktop-build/targets/mac-arm64/unsigned-artifacts/$artifact" "package/$artifact"
           node automation/scripts/metadata.mjs record source "package/$artifact" package
+          cp source/.dsh-build/client-build-environment.json package/client-build-environment.json
           (cd package && shasum -a 256 -c SHA256SUMS)
           du -sh package source/apps/desktop/.desktop-build
           df -h "$GITHUB_WORKSPACE"
@@ -142,6 +145,7 @@ jobs:
 
   publish:
     needs: [resolve, build]
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

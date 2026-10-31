@@ -21,5 +21,6 @@ jobs:
         run: |
           bash -n bin/dsh-desktop scripts/resolve.sh scripts/publish.sh scripts/keepalive.sh
           node --check scripts/metadata.mjs
+          node --check scripts/official-ui.mjs
       - name: Test version selection and installation recovery
         run: python3 -B -m unittest discover -s tests -v
