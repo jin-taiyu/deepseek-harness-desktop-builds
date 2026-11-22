@@ -3,7 +3,7 @@ set -euo pipefail
 
 DSH_DESKTOP_REPO="${DSH_DESKTOP_REPO:-jin-taiyu/deepseek-harness-desktop-builds}"
 DSH_UPSTREAM_REPO=deepseek-ai/deepseek-harness
-DSH_DESKTOP_RELEASE_SUFFIX=+official.1
+DSH_DESKTOP_RELEASE_SUFFIX=+official.2
 DSH_APPLICATIONS_DIR="${DSH_APPLICATIONS_DIR:-/Applications}"
 DSH_JQ='
 def version_key:
@@ -20,18 +20,39 @@ def sorted_releases($prefix):
     | ($version | version_key) as $key
     | $release + {_version: $version, _version_key: $key})
   | sort_by([._version_key, .published_at, .id]);
+def has_assets($expected):
+  [.assets[]? | select(.state == "uploaded" and .size > 0) | .name] as $names
+  | $expected | all(. as $name | $names | index($name) != null);
+def complete_arch($arch):
+  . as $release
+  | ._version as $version
+  | if ($release.tag_name | endswith("+official.2")) then
+      $release | has_assets(["deepseek-harness-\($version)-mac-\($arch)-unsigned.dmg", "build-info-\($arch).json", "SHA256SUMS-\($arch)"])
+    elif $arch == "arm64" then
+      $release | has_assets(["deepseek-harness-\($version)-mac-arm64-unsigned.dmg", "SHA256SUMS", "build-info.json"])
+    else false end;
 def complete_build:
   . as $release
-  | "deepseek-harness-\(._version)-mac-arm64-unsigned.dmg" as $dmg
-  | [.assets[]? | select(.state == "uploaded" and .size > 0) | .name] as $names
-  | select([$dmg, "SHA256SUMS", "build-info.json"] | all(. as $name | $names | index($name) != null));
+  | if ($release.tag_name | endswith("+official.2")) then
+      ($release | complete_arch("arm64")) and ($release | complete_arch("x64"))
+    else $release | complete_arch("arm64") end;
 def desktop_releases:
-  sorted_releases("desktop-v") | map(._version |= sub("[+]official[.]1$"; ""));
+  sorted_releases("desktop-v") | map(._version |= sub("[+]official[.][0-9]+$"; ""));
 '
 
 dsh_fail() {
   printf '%s\n' "$*" >&2
   return 1
+}
+
+dsh_native_arch() {
+  case "$(uname -m)" in
+    arm64) printf 'arm64\n' ;;
+    x86_64)
+      if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ]; then printf 'arm64\n'; else printf 'x64\n'; fi
+      ;;
+    *) dsh_fail "Unsupported macOS CPU architecture: $(uname -m)"; return 1 ;;
+  esac
 }
 
 dsh_require() {
@@ -58,42 +79,56 @@ dsh_latest_upstream() {
 
 dsh_built_release() {
   local tag="${1:-}"
+  local arch="${2:-$(dsh_native_arch)}"
   local releases
+  case "$arch" in arm64|x64) ;; *) dsh_fail "Unsupported macOS architecture: $arch"; return 1 ;; esac
   releases=$(dsh_releases "$DSH_DESKTOP_REPO") || return 1
   if [ -n "$tag" ]; then
     dsh_validate_tag "$tag" || return 1
-    printf '%s\n' "$releases" | jq -ce --arg version "${tag#dsh-v}" "$DSH_JQ desktop_releases | map(select(._version == \$version) | complete_build) | last // error(\"No complete build for this tag\")"
+    printf '%s\n' "$releases" | jq -ce --arg version "${tag#dsh-v}" --arg arch "$arch" "$DSH_JQ desktop_releases | map(select(._version == \$version) | select(complete_arch(\$arch))) | last // error(\"No complete build for this tag and architecture\")"
   else
-    printf '%s\n' "$releases" | jq -ce "$DSH_JQ desktop_releases | map(complete_build) | last // error(\"No complete Desktop build found\")"
+    printf '%s\n' "$releases" | jq -ce --arg arch "$arch" "$DSH_JQ desktop_releases | map(select(complete_arch(\$arch))) | last // error(\"No complete Desktop build found for this architecture\")"
   fi
 }
 
 dsh_validate_download() {
   local directory="$1"
   local release="$2"
+  local arch="${3:-arm64}"
   local version artifact digest name extra official=false count=0 dmg_count=0 metadata_count=0
+  local checksums metadata tag
+  case "$arch" in arm64|x64) ;; *) dsh_fail "Unsupported macOS architecture: $arch"; return 1 ;; esac
   version=$(printf '%s\n' "$release" | jq -er '._version') || return 1
-  artifact="deepseek-harness-$version-mac-arm64-unsigned.dmg"
+  tag=$(printf '%s\n' "$release" | jq -r '.tag_name // ""')
+  artifact="deepseek-harness-$version-mac-$arch-unsigned.dmg"
+  if [[ "$tag" = *"$DSH_DESKTOP_RELEASE_SUFFIX" ]]; then
+    checksums="SHA256SUMS-$arch"
+    metadata="build-info-$arch.json"
+  else
+    [ "$arch" = arm64 ] || { dsh_fail 'This older Release has no Intel build'; return 1; }
+    checksums=SHA256SUMS
+    metadata=build-info.json
+  fi
   while read -r digest name extra; do
     [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { dsh_fail 'Invalid checksum entry'; return 1; }
     [ -z "$extra" ] || { dsh_fail 'Unexpected checksum fields'; return 1; }
     case "$name" in
       "$artifact") dmg_count=$((dmg_count + 1)) ;;
-      build-info.json) metadata_count=$((metadata_count + 1)) ;;
+      "$metadata") metadata_count=$((metadata_count + 1)) ;;
       *) dsh_fail "Unexpected checksum path: $name"; return 1 ;;
     esac
     count=$((count + 1))
-  done < "$directory/SHA256SUMS"
+  done < "$directory/$checksums"
   [ "$count" -eq 2 ] && [ "$dmg_count" -eq 1 ] && [ "$metadata_count" -eq 1 ] || { dsh_fail 'Expected one checksum for each downloaded file'; return 1; }
-  (cd "$directory" && shasum -a 256 -c SHA256SUMS) >&2 || return 1
+  (cd "$directory" && shasum -a 256 -c "$checksums") >&2 || return 1
   digest=$(shasum -a 256 "$directory/$artifact") || return 1
   digest="${digest%% *}"
-  if [[ "$(printf '%s\n' "$release" | jq -r '.tag_name // ""')" = *"$DSH_DESKTOP_RELEASE_SUFFIX" ]]; then official=true; fi
-  jq -e --arg version "$version" --arg artifact "$artifact" --arg digest "$digest" --arg repo "$DSH_UPSTREAM_REPO" --argjson official "$official" '
+  if [[ "$tag" = *"+official.1" || "$tag" = *"$DSH_DESKTOP_RELEASE_SUFFIX" ]]; then official=true; fi
+  jq -e --arg version "$version" --arg arch "$arch" --arg artifact "$artifact" --arg digest "$digest" --arg repo "$DSH_UPSTREAM_REPO" --argjson official "$official" '
     .schema_version == 1 and .version == $version
     and .upstream.repository == $repo and .upstream.tag == ("dsh-v" + $version)
     and (.upstream.commit | test("^[0-9a-f]{40}$"))
-    and .target.platform == "darwin" and .target.arch == "arm64"
+    and .target.platform == "darwin" and .target.arch == $arch
     and .application.name == "DeepSeek Harness.app"
     and .application.bundle_id == "com.deepseek.harness"
     and .artifact.name == $artifact and .artifact.sha256 == $digest
@@ -105,20 +140,29 @@ dsh_validate_download() {
       and .client.environment.DSH_CLIENT_VERSION == $version
       and .client.environment.DSH_CLIENT_COMMIT_HASH == .upstream.commit[0:7]
       else true end)
-  ' "$directory/build-info.json" >/dev/null || { dsh_fail 'Build metadata validation failed'; return 1; }
+  ' "$directory/$metadata" >/dev/null || { dsh_fail 'Build metadata validation failed'; return 1; }
 }
 
 dsh_download_into() {
   local release="$1"
   local directory="$2"
-  local tag version artifact
+  local arch="${3:-arm64}"
+  local tag version artifact checksums metadata
   tag=$(printf '%s\n' "$release" | jq -er '.tag_name') || return 1
   version=$(printf '%s\n' "$release" | jq -er '._version') || return 1
-  artifact="deepseek-harness-$version-mac-arm64-unsigned.dmg"
+  artifact="deepseek-harness-$version-mac-$arch-unsigned.dmg"
+  if [[ "$tag" = *"$DSH_DESKTOP_RELEASE_SUFFIX" ]]; then
+    checksums="SHA256SUMS-$arch"
+    metadata="build-info-$arch.json"
+  else
+    [ "$arch" = arm64 ] || { dsh_fail 'This older Release has no Intel build'; return 1; }
+    checksums=SHA256SUMS
+    metadata=build-info.json
+  fi
   mkdir -p "$directory" || return 1
   gh release download "$tag" --repo "$DSH_DESKTOP_REPO" --dir "$directory" \
-    --pattern "$artifact" --pattern SHA256SUMS --pattern build-info.json || return 1
-  dsh_validate_download "$directory" "$release"
+    --pattern "$artifact" --pattern "$checksums" --pattern "$metadata" || return 1
+  dsh_validate_download "$directory" "$release" "$arch"
 }
 
 dsh_running() {
@@ -128,10 +172,12 @@ dsh_running() {
 dsh_install() (
   set -euo pipefail
   local tag="${1:-}"
-  local release version artifact temporary mountpoint application target stage=''
+  local arch expected_file_arch release version artifact temporary mountpoint application target stage=''
   local mounted=0 privileged=0 had_old=0 new_installed=0 committed=0 preserve_stage=0
   dsh_require gh jq shasum hdiutil ditto plutil codesign file ps awk mktemp
-  [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] || { dsh_fail 'Installation requires an Apple Silicon Mac'; exit 1; }
+  [ "$(uname -s)" = Darwin ] || { dsh_fail 'Installation requires macOS'; exit 1; }
+  arch=$(dsh_native_arch)
+  case "$arch" in arm64) expected_file_arch=arm64 ;; x64) expected_file_arch=x86_64 ;; esac
   [[ "$DSH_APPLICATIONS_DIR" = /* ]] && [ -d "$DSH_APPLICATIONS_DIR" ] && [ ! -L "$DSH_APPLICATIONS_DIR" ] || { dsh_fail 'Applications directory must be an existing absolute directory, not a symlink'; exit 1; }
   target="$DSH_APPLICATIONS_DIR/DeepSeek Harness.app"
   [ ! -L "$target" ] || { dsh_fail 'Refusing to replace a linked application'; exit 1; }
@@ -169,10 +215,10 @@ dsh_install() (
   trap dsh_install_cleanup EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  release=$(dsh_built_release "$tag")
+  release=$(dsh_built_release "$tag" "$arch")
   version=$(printf '%s\n' "$release" | jq -er '._version')
-  artifact="deepseek-harness-$version-mac-arm64-unsigned.dmg"
-  dsh_download_into "$release" "$temporary/download"
+  artifact="deepseek-harness-$version-mac-$arch-unsigned.dmg"
+  dsh_download_into "$release" "$temporary/download" "$arch"
   mkdir "$mountpoint"
   hdiutil verify "$temporary/download/$artifact" >/dev/null
   hdiutil attach "$temporary/download/$artifact" -readonly -nobrowse -mountpoint "$mountpoint" >/dev/null
@@ -184,7 +230,7 @@ dsh_install() (
   local executable
   executable=$(plutil -extract CFBundleExecutable raw -o - "$application/Contents/Info.plist")
   case "$executable" in ''|*/*|.|..) dsh_fail 'Invalid application executable'; exit 1 ;; esac
-  file "$application/Contents/MacOS/$executable" | grep -q arm64
+  file "$application/Contents/MacOS/$executable" | grep -q "$expected_file_arch"
   codesign --verify --strict "$application"
   if dsh_running "$target"; then dsh_fail 'DeepSeek Harness started during download; fully quit it and retry'; exit 1; fi
   stage=$(dsh_install_command mktemp -d "$DSH_APPLICATIONS_DIR/.dsh-desktop-install.XXXXXX")
@@ -203,11 +249,12 @@ dsh_install() (
 )
 
 dsh_check() {
-  local upstream built
+  local upstream built arch
+  arch=$(dsh_native_arch)
   upstream=$(dsh_latest_upstream)
   printf 'Upstream: %s\n' "$(printf '%s\n' "$upstream" | jq -er '.tag_name')"
-  built=$(dsh_built_release '') || return 1
-  printf 'Built:    %s\n' "$(printf '%s\n' "$built" | jq -er '.tag_name')"
+  built=$(dsh_built_release '' "$arch") || return 1
+  printf 'Built:    %s (%s)\n' "$(printf '%s\n' "$built" | jq -er '.tag_name')" "$arch"
   if [ -f "$DSH_APPLICATIONS_DIR/DeepSeek Harness.app/Contents/Info.plist" ] && command -v plutil >/dev/null 2>&1; then
     printf 'Installed: %s\n' "$(plutil -extract CFBundleShortVersionString raw -o - "$DSH_APPLICATIONS_DIR/DeepSeek Harness.app/Contents/Info.plist")"
   fi
@@ -228,6 +275,7 @@ dsh_build() {
   gh workflow run desktop.yml --repo "$DSH_DESKTOP_REPO" --ref main \
     -f "upstream_tag=$tag" -f "request_id=$request_id"
   printf 'Build requested: %s\n' "$request_id"
+  printf '%s\n' 'The workflow packages both arm64 and Intel x64 DMGs.'
   if [ "$wait_for_run" -eq 0 ]; then
     printf 'https://github.com/%s/actions/workflows/desktop.yml\n' "$DSH_DESKTOP_REPO"
     return 0
@@ -244,26 +292,29 @@ dsh_build() {
 }
 
 dsh_download() {
-  local tag='' directory='' release
+  local tag='' directory='' arch release
+  arch=$(dsh_native_arch)
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --dest) [ "$#" -gt 1 ] || { dsh_fail '--dest requires a directory'; return 1; }; directory="$2"; shift ;;
+      --arch) [ "$#" -gt 1 ] || { dsh_fail '--arch requires arm64 or x64'; return 1; }; arch="$2"; shift ;;
       --*) dsh_fail "Unknown download option: $1"; return 1 ;;
       *) [ -z "$tag" ] || { dsh_fail 'Specify only one upstream tag'; return 1; }; tag="$1" ;;
     esac
     shift
   done
   [ -n "$directory" ] || { dsh_fail 'Use --dest to choose a download directory'; return 1; }
-  release=$(dsh_built_release "$tag")
-  dsh_download_into "$release" "$directory"
-  printf 'Verified download: %s\n' "$directory"
+  case "$arch" in arm64|x64) ;; *) dsh_fail '--arch must be arm64 or x64'; return 1 ;; esac
+  release=$(dsh_built_release "$tag" "$arch")
+  dsh_download_into "$release" "$directory" "$arch"
+  printf 'Verified %s download: %s\n' "$arch" "$directory"
 }
 
 dsh_usage() {
   printf '%s\n' \
     'dsh-desktop check' \
     'dsh-desktop build [dsh-vVERSION] [--wait]' \
-    'dsh-desktop download [dsh-vVERSION] --dest DIRECTORY' \
+    'dsh-desktop download [dsh-vVERSION] --dest DIRECTORY [--arch arm64|x64]' \
     'dsh-desktop install [dsh-vVERSION]'
 }
 

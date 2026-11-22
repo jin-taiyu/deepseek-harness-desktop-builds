@@ -19,13 +19,17 @@ own_release=$(dsh_releases "$DSH_DESKTOP_REPO" | jq -c --arg tag "desktop-v$vers
 should_build=true
 if [ "$own_release" != null ]; then
   if printf '%s\n' "$own_release" | jq -e --arg version "$version" "$DSH_JQ . + {_version: \$version} | select(.draft == false) | complete_build" >/dev/null; then
-    manifest=$(gh release download "desktop-v$version$DSH_DESKTOP_RELEASE_SUFFIX" --repo "$DSH_DESKTOP_REPO" --pattern build-info.json --output -)
-    printf '%s\n' "$manifest" | jq -e --arg sha "$source_sha" --arg tag "$tag" --arg version "$version" --arg repo "$DSH_UPSTREAM_REPO" \
-      '.schema_version == 1 and .upstream.repository == $repo and .upstream.tag == $tag and .upstream.commit == $sha and .version == $version
-      and .build_recipe == "official-ui-v1" and .client.profile == "official"' >/dev/null || {
-      dsh_fail 'Published build metadata differs from the current upstream tag; refusing to overwrite it'
-      exit 1
-    }
+    for arch in arm64 x64; do
+      manifest=$(gh release download "desktop-v$version$DSH_DESKTOP_RELEASE_SUFFIX" --repo "$DSH_DESKTOP_REPO" --pattern "build-info-$arch.json" --output -)
+      printf '%s\n' "$manifest" | jq -e --arg sha "$source_sha" --arg tag "$tag" --arg version "$version" --arg repo "$DSH_UPSTREAM_REPO" --arg arch "$arch" \
+        '.schema_version == 1 and .upstream.repository == $repo and .upstream.tag == $tag and .upstream.commit == $sha and .version == $version
+        and .build_recipe == "official-ui-v1" and .client.profile == "official"
+        and .target.platform == "darwin" and .target.arch == $arch
+        and .artifact.name == ("deepseek-harness-" + $version + "-mac-" + $arch + "-unsigned.dmg")' >/dev/null || {
+        dsh_fail "Published $arch build metadata differs from the current upstream tag; refusing to overwrite it"
+        exit 1
+      }
+    done
     should_build=false
   elif printf '%s\n' "$own_release" | jq -e '.draft == false' >/dev/null; then
     dsh_fail 'An incomplete published Release already exists; inspect it before rebuilding'

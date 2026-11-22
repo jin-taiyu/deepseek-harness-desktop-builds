@@ -40,13 +40,15 @@ if command == "gh":
             name = "upstream.json" if "deepseek-ai/deepseek-harness/" in endpoint else "built.json"
             print(json.dumps([json.loads((root / name).read_text())]))
     elif args[:2] == ["release", "download"]:
+        patterns = [args[index + 1] for index, value in enumerate(args[:-1]) if value == "--pattern"]
         if "--output" in args:
-            print((root / "assets/build-info.json").read_text())
+            print((root / "assets" / patterns[0]).read_text())
         else:
             dest = Path(option("--dir"))
             dest.mkdir(parents=True, exist_ok=True)
             for name in (root / "assets").iterdir():
-                shutil.copy2(name, dest / name.name)
+                if name.name in patterns:
+                    shutil.copy2(name, dest / name.name)
     elif args[:2] == ["workflow", "run"]:
         request = next(x.split("=", 1)[1] for x in args if x.startswith("request_id="))
         (root / "request-id").write_text(request)
@@ -103,9 +105,12 @@ def release(version, prefix="dsh-v", draft=False, complete=False, published="202
 
 
 def official_release(version, published="2026-10-17T12:00:00Z"):
-    result = release(version, "desktop-v", complete=True, published=published)
-    result["tag_name"] += "+official.1"
-    return result
+    assets = [{"name": name, "state": "uploaded", "size": 100} for name in [
+        f"deepseek-harness-{version}-mac-arm64-unsigned.dmg", "build-info-arm64.json", "SHA256SUMS-arm64",
+        f"deepseek-harness-{version}-mac-x64-unsigned.dmg", "build-info-x64.json", "SHA256SUMS-x64",
+    ]]
+    return {"id": 1, "tag_name": "desktop-v" + version + "+official.2", "draft": False,
+            "prerelease": "-" in version, "published_at": published, "assets": assets}
 
 
 class AutomationTests(unittest.TestCase):
@@ -120,24 +125,26 @@ class AutomationTests(unittest.TestCase):
             path.chmod(0o755)
         self.assets = self.root / "assets"
         self.assets.mkdir()
-        filename = f"deepseek-harness-{VERSION}-mac-arm64-unsigned.dmg"
-        payload = b"unit-test-dmg"
-        (self.assets / filename).write_bytes(payload)
-        metadata = {"schema_version": 1, "version": VERSION,
-                    "build_recipe": "official-ui-v1", "source_patch": {"recipe": "official-ui-v1"},
-                    "client": {"profile": "official", "title": "DeepSeek Harness", "environment": {
-                        "DSH_CLIENT_BUILD_PROFILE": "official", "DSH_CLIENT_TITLE": "DeepSeek Harness",
-                        "DSH_CLIENT_VERSION": VERSION, "DSH_CLIENT_COMMIT_HASH": COMMIT[:7]}},
-                    "upstream": {"repository": "deepseek-ai/deepseek-harness", "tag": "dsh-v" + VERSION, "commit": COMMIT},
-                    "target": {"platform": "darwin", "arch": "arm64"},
-                    "application": {"name": "DeepSeek Harness.app", "bundle_id": "com.deepseek.harness"},
-                    "artifact": {"name": filename, "sha256": hashlib.sha256(payload).hexdigest()},
-                    "signing": "ad-hoc", "automatic_updates": False}
-        metadata_bytes = json.dumps(metadata).encode()
-        (self.assets / "build-info.json").write_bytes(metadata_bytes)
-        (self.assets / "SHA256SUMS").write_text(
-            f"{hashlib.sha256(payload).hexdigest()}  {filename}\n"
-            f"{hashlib.sha256(metadata_bytes).hexdigest()}  build-info.json\n")
+        for arch in ("arm64", "x64"):
+            filename = f"deepseek-harness-{VERSION}-mac-{arch}-unsigned.dmg"
+            payload = f"unit-test-dmg-{arch}".encode()
+            (self.assets / filename).write_bytes(payload)
+            metadata = {"schema_version": 1, "version": VERSION,
+                        "build_recipe": "official-ui-v1", "source_patch": {"recipe": "official-ui-v1"},
+                        "client": {"profile": "official", "title": "DeepSeek Harness", "environment": {
+                            "DSH_CLIENT_BUILD_PROFILE": "official", "DSH_CLIENT_TITLE": "DeepSeek Harness",
+                            "DSH_CLIENT_VERSION": VERSION, "DSH_CLIENT_COMMIT_HASH": COMMIT[:7]}},
+                        "upstream": {"repository": "deepseek-ai/deepseek-harness", "tag": "dsh-v" + VERSION, "commit": COMMIT},
+                        "target": {"platform": "darwin", "arch": arch},
+                        "application": {"name": "DeepSeek Harness.app", "bundle_id": "com.deepseek.harness"},
+                        "artifact": {"name": filename, "sha256": hashlib.sha256(payload).hexdigest()},
+                        "signing": "ad-hoc", "automatic_updates": False}
+            metadata_bytes = json.dumps(metadata).encode()
+            metadata_name = f"build-info-{arch}.json"
+            (self.assets / metadata_name).write_bytes(metadata_bytes)
+            (self.assets / f"SHA256SUMS-{arch}").write_text(
+                f"{hashlib.sha256(payload).hexdigest()}  {filename}\n"
+                f"{hashlib.sha256(metadata_bytes).hexdigest()}  {metadata_name}\n")
         self.write_releases([release(VERSION)], [official_release(VERSION)])
         self.applications = self.root / "Applications"
         self.applications.mkdir()
@@ -221,15 +228,15 @@ class AutomationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             selected = json.loads(result.stdout)
             self.assertEqual(selected["_version"], VERSION)
-            self.assertEqual(selected["tag_name"], "desktop-v" + VERSION + "+official.1")
+            self.assertEqual(selected["tag_name"], "desktop-v" + VERSION + "+official.2")
 
     def test_local_profile_is_rejected_for_corrected_release(self):
-        metadata = self.assets / "build-info.json"
+        metadata = self.assets / "build-info-arm64.json"
         data = json.loads(metadata.read_text())
         data["client"]["profile"] = "local"
         metadata.write_text(json.dumps(data))
-        sums = self.assets / "SHA256SUMS"
-        sums.write_text(sums.read_text().splitlines()[0] + "\n" + hashlib.sha256(metadata.read_bytes()).hexdigest() + "  build-info.json\n")
+        sums = self.assets / "SHA256SUMS-arm64"
+        sums.write_text(sums.read_text().splitlines()[0] + "\n" + hashlib.sha256(metadata.read_bytes()).hexdigest() + "  build-info-arm64.json\n")
         result = self.run_cli("install")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Build metadata validation failed", result.stderr)
@@ -267,7 +274,7 @@ class AutomationTests(unittest.TestCase):
         self.assert_clean_installation()
 
     def test_duplicate_checksums_are_rejected(self):
-        sums = self.assets / "SHA256SUMS"
+        sums = self.assets / "SHA256SUMS-arm64"
         first_line = sums.read_text().splitlines()[0]
         sums.write_text(first_line + "\n" + first_line + "\n")
         result = self.run_cli("install")

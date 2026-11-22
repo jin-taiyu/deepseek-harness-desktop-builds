@@ -13,7 +13,9 @@ const desktopManifest = JSON.parse(await readFile(join(source, 'apps/desktop/pac
 const version = process.env.BUILD_VERSION;
 const tag = process.env.BUILD_UPSTREAM_TAG;
 const commit = process.env.BUILD_SOURCE_SHA;
+const arch = process.env.BUILD_ARCH;
 if (!version || !tag || !/^[0-9a-f]{40}$/.test(commit ?? '')) throw new Error('Missing build identity');
+if (arch !== 'arm64' && arch !== 'x64') throw new Error('BUILD_ARCH must be arm64 or x64');
 if (tag !== `dsh-v${version}` || rootManifest.version !== version || desktopManifest.version !== version) throw new Error('Source versions do not match the selected tag');
 if (execFileSync('git', ['rev-parse', 'HEAD'], { cwd: source, encoding: 'utf8' }).trim() !== commit) throw new Error('Checked-out commit differs from the resolved upstream commit');
 if (mode === 'verify') {
@@ -26,7 +28,7 @@ const { readClientBuildRecord, officialClientBuildEnvironment } = await import(p
 const clientBuild = readClientBuildRecord(source, officialClientBuildEnvironment(source));
 const artifact = resolve(artifactArgument);
 const output = resolve(outputArgument);
-const filename = `deepseek-harness-${version}-mac-arm64-unsigned.dmg`;
+const filename = `deepseek-harness-${version}-mac-${arch}-unsigned.dmg`;
 if (basename(artifact) !== filename || !(await stat(artifact)).isFile()) throw new Error('Unexpected DMG');
 const hash = createHash('sha256');
 for await (const chunk of createReadStream(artifact)) hash.update(chunk);
@@ -39,7 +41,7 @@ const metadata = {
   client: { profile: 'official', title: clientBuild.environment.DSH_CLIENT_TITLE, environment: clientBuild.environment, artifacts: clientBuild.artifacts },
   version,
   upstream: { repository: 'deepseek-ai/deepseek-harness', tag, commit, release_url: `https://github.com/deepseek-ai/deepseek-harness/releases/tag/${tag}` },
-  target: { platform: 'darwin', arch: 'arm64' },
+  target: { platform: 'darwin', arch },
   application: { name: 'DeepSeek Harness.app', bundle_id: 'com.deepseek.harness' },
   artifact: { name: filename, sha256: digest, size: (await stat(artifact)).size },
   signing: 'ad-hoc',
@@ -49,5 +51,6 @@ const metadata = {
 };
 await mkdir(output, { recursive: true });
 const metadataBytes = `${JSON.stringify(metadata, null, 2)}\n`;
-await writeFile(join(output, 'build-info.json'), metadataBytes);
-await writeFile(join(output, 'SHA256SUMS'), `${digest}  ${filename}\n${createHash('sha256').update(metadataBytes).digest('hex')}  build-info.json\n`);
+const metadataFilename = `build-info-${arch}.json`;
+await writeFile(join(output, metadataFilename), metadataBytes);
+await writeFile(join(output, `SHA256SUMS-${arch}`), `${digest}  ${filename}\n${createHash('sha256').update(metadataBytes).digest('hex')}  ${metadataFilename}\n`);
