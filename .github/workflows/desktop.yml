@@ -127,7 +127,7 @@ jobs:
       - name: Verify application and record provenance
         shell: bash
         run: |
-          application="source/apps/desktop/.desktop-build/targets/mac-$BUILD_ARCH/unsigned-artifacts/mac-$BUILD_ARCH/DeepSeek Harness.app"
+          application="source/apps/desktop/.desktop-build/targets/mac-$BUILD_ARCH/unsigned-artifacts/mac/DeepSeek Harness.app"
           test "$(plutil -extract CFBundleShortVersionString raw -o - "$application/Contents/Info.plist")" = "$BUILD_VERSION"
           test "$(plutil -extract CFBundleIdentifier raw -o - "$application/Contents/Info.plist")" = com.deepseek.harness
           executable=$(plutil -extract CFBundleExecutable raw -o - "$application/Contents/Info.plist")
