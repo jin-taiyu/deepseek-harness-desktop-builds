@@ -86,11 +86,13 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: '24'
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
-        with:
-          package_json_file: source/package.json
-          dest: ${{ runner.temp }}/setup-pnpm
-          run_install: false
+      - name: Install the source-pinned pnpm JavaScript package
+        shell: bash
+        run: |
+          pnpm_version=$(node --input-type=module -e 'import { readFileSync } from "node:fs"; const packageManager = JSON.parse(readFileSync("source/package.json", "utf8")).packageManager; if (!packageManager?.startsWith("pnpm@")) process.exit(1); process.stdout.write(packageManager.slice(5).split("+")[0]);')
+          npm install --prefix "$RUNNER_TEMP/pnpm" --no-audit --no-fund "pnpm@$pnpm_version"
+          echo "$RUNNER_TEMP/pnpm/node_modules/.bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/pnpm/node_modules/.bin/pnpm" --version
       - name: Check source and runner
         id: paths
         shell: bash
